@@ -17,6 +17,7 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_worker.py
 #
 
+import copy
 from typing import Optional
 
 import torch
@@ -27,7 +28,8 @@ from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment)
-from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
+from vllm.distributed.kv_transfer import (ensure_kv_transfer_initialized,
+                                          has_kv_transfer_group)
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
@@ -35,7 +37,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, GiB_bytes
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
 
 import vllm_ascend.envs as envs_ascend
@@ -49,6 +51,7 @@ from vllm_ascend.utils import (check_kv_cache_bytes_cache_exist,
                                read_kv_cache_bytes_from_file,
                                sleep_mode_enabled, try_register_lib)
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from ucm.integration.vllm.ucm_sparse.state import ensure_ucm_sparse_initialized
 
 
 class NPUWorker(WorkerBase):
@@ -222,9 +225,22 @@ class NPUWorker(WorkerBase):
             assert isinstance(output, IntermediateTensors)
             get_pp_group().send_tensor_dict(output.tensors,
                                             all_gather_group=get_tp_group())
-            return None
+            if not has_kv_transfer_group():
+                return None
+
+            kv_connector_output = output.kv_connector_output
+            finished_sending = kv_connector_output.finished_sending
+            finished_recving = kv_connector_output.finished_recving
+
+            if not finished_sending and not finished_recving:
+                return EMPTY_MODEL_RUNNER_OUTPUT
+
+            new_output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
+            new_output.kv_connector_output = kv_connector_output
+            return new_output
+
         assert isinstance(output, ModelRunnerOutput)
-        return output if self.is_driver_worker else None
+        return output
 
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:
@@ -321,6 +337,7 @@ class NPUWorker(WorkerBase):
             parallel_config.world_size_across_dp,
         )
         ensure_kv_transfer_initialized(self.vllm_config)
+        ensure_ucm_sparse_initialized(self.vllm_config)
 
     def _init_profiler(self):
         # Torch profiler. Enabled and configured through env vars:
