@@ -13,10 +13,12 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.linear import (LinearBase,
                                                UnquantizedLinearMethod)
 from vllm.utils import cdiv, round_down
+from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.attention.layer import (maybe_execute_sparse_attention_begin, maybe_execute_sparse_attention_finished)
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention import _ALLOWED_NUM_QUERIES_PER_KV
-from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.attention_v1 import AscendAttentionState, wait_for_kv_layer_from_connector, maybe_save_kv_layer_to_connector
 from vllm_ascend.multistream.base import MSAttentionMetadataSplitConfig
 from vllm_ascend.multistream.context import get_multistream_comm_context
 from vllm_ascend.multistream.ms_split import model_input_split_v1_mla_attn
@@ -1042,6 +1044,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         enable_multistream_mla: bool = False,
         ckq: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        forward_context: ForwardContext = get_forward_context()
         assert output is not None, "Output tensor must be provided."
         if attn_metadata is None:
             # Profiling run.
@@ -1192,6 +1195,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             # FIX: aicore move should be also placed on the comm stream in dbo,
             # otherwise it may affect the accuracy
             # TODO: use an elegant way to overlap
+            wait_for_kv_layer_from_connector(layer.layer_name)
+            prefill_q, _, _, _ =  maybe_execute_sparse_attention_begin(prefill_q, prefill_k_c_normed, k_pe, layer.layer_name, forward_context, output=output, phase="prefill")
             output_prefill = self._forward_prefill(prefill_q,
                                                    prefill_k_c_normed,
                                                    prefill_k_pe, kv_cache,
@@ -1203,8 +1208,11 @@ class AscendMLAImpl(MLAAttentionImpl):
                     current_ms_metadata.after_comm_event.record()
             else:
                 output[num_decode_tokens:] = output_prefill
-
+            maybe_execute_sparse_attention_finished(prefill_q, prefill_k_c_normed, prefill_k_pe, output[num_decode_tokens:], layer.layer_name, forward_context, "prefill")
+            maybe_save_kv_layer_to_connector(layer.layer_name, kv_cache)
         if has_decode:
+            wait_for_kv_layer_from_connector(layer.layer_name)
+            _, _, _, _ = maybe_execute_sparse_attention_begin(torch.cat([decode_ql_nope, decode_q_pe],dim=-1), decode_k_nope, k_pe, layer.layer_name, forward_context, output=output, phase="decode")
             if self.running_in_graph:
                 return self._forward_decode(decode_ql_nope, decode_q_pe,
                                             decode_k_nope, decode_k_pe,
@@ -1223,5 +1231,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                     current_ms_metadata.after_comm_event.record()
             else:
                 output[:num_decode_tokens] = output_decode
+            maybe_execute_sparse_attention_finished(torch.cat([decode_ql_nope, decode_q_pe],dim=-1), decode_ql_nope, decode_q_pe, output[:num_decode_tokens], layer.layer_name, forward_context, "decode")
+            maybe_save_kv_layer_to_connector(layer.layer_name, kv_cache)
 
         return output_padded

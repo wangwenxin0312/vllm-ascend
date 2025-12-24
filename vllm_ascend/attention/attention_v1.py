@@ -24,6 +24,9 @@ import torch_npu
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionLayer, AttentionType)
 from vllm.attention.backends.utils import CommonAttentionState
+from vllm.distributed.kv_transfer import (get_kv_transfer_group,
+                                          has_kv_transfer_group,
+                                          is_v1_kv_transfer_group)
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.utils import direct_register_custom_op
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -32,6 +35,8 @@ from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm_ascend.ops.attention import vanilla_chunked_prefill
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_NZ, aligned_16, is_310p,
                                nd_to_nz_2d, nd_to_nz_spec)
+
+from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
 
 
 class AscendAttentionBackend(AttentionBackend):
@@ -444,10 +449,14 @@ def unified_ascend_attention_with_output(
     output: torch.Tensor,
     layer_name: str,
 ) -> None:
+    wait_for_kv_layer_from_connector(layer_name)
+
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
+    if not self.use_mla:
+        query, _, _, _ = maybe_execute_sparse_attention_begin(query, key, value, layer_name, forward_context)
     self.impl.forward(self,
                       query,
                       key,
@@ -456,8 +465,79 @@ def unified_ascend_attention_with_output(
                       attn_metadata,
                       output,
                       trace_flag=False)
+    if not self.use_mla:
+        maybe_execute_sparse_attention_finished(query, key, value, output, layer_name, forward_context)
+    maybe_save_kv_layer_to_connector(layer_name, kv_cache)
     return
 
+def wait_for_kv_layer_from_connector(layer_name: str):
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+
+    connector = get_kv_transfer_group()
+
+    forward_context: ForwardContext = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
+    if attn_metadata is None:
+        return
+    connector.wait_for_layer_load(layer_name)
+
+def maybe_save_kv_layer_to_connector(
+    layer_name: str,
+    kv_cache_layer: List[torch.Tensor],
+):
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+
+    connector = get_kv_transfer_group()
+
+    forward_context: ForwardContext = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
+    if attn_metadata is None:
+        return
+    connector.save_kv_layer(layer_name, kv_cache_layer,
+                            attn_metadata)
+
+def maybe_execute_sparse_attention_begin(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        layer_name: str,
+        forward_context: ForwardContext,
+        output: Optional[torch.Tensor] = None,
+        phase: Optional[str] = None,
+):
+    if not has_ucm_sparse():
+            return query, key, value, output
+
+    ucm_sparse = get_ucm_sparse()
+
+    attn_metadata = forward_context.attn_metadata
+    if attn_metadata is None:
+        return query, key, value, output
+
+    return ucm_sparse.attention_begin(
+        query, key, value, layer_name, forward_context, output, phase
+    )
+
+def maybe_execute_sparse_attention_finished(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_output: torch.Tensor,
+        layer_name: str,
+        forward_context: ForwardContext,
+):
+    if not has_ucm_sparse():
+        return
+
+    ucm_sparse = get_ucm_sparse()
+
+    attn_metadata = forward_context.attn_metadata
+    if attn_metadata is None:
+        return
+
+    ucm_sparse.attention_finished(query, key, value, attn_output, layer_name, forward_context)
 
 def unified_attention_with_output_fake(
     query: torch.Tensor,
